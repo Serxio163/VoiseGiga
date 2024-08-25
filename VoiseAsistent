@@ -1,0 +1,146 @@
+import os
+import time
+from datetime import datetime, timedelta
+from queue import Queue
+from time import sleep
+
+import numpy as np
+import speech_recognition as sr
+import torch
+import whisper
+import keyboard
+import sounddevice as sd
+import re
+
+from langchain.schema import HumanMessage, SystemMessage
+from langchain_community.chat_models.gigachat import GigaChat
+
+def normalize_text(text):
+    return re.sub(r'[^\w\s]', '', text)
+
+def record_callback(data_queue, audio: sr.AudioData) -> None:
+    data_queue.put(audio.get_raw_data())
+
+def transcribe_audio(audio_model, audio_data, device):
+    audio_np = np.frombuffer(audio_data, dtype=np.int16).astype(np.float32) / 32768.0
+    audio_np = torch.from_numpy(audio_np).to(device)
+    result = audio_model.transcribe(audio_np, fp16=torch.cuda.is_available())
+    return result['text'].strip()
+
+def main():
+    model_size = "base"
+    energy_threshold = 1000
+    record_timeout = 2
+    phrase_timeout = 3
+
+    phrase_time = None
+    data_queue = Queue()
+    recorder = sr.Recognizer()
+    recorder.energy_threshold = energy_threshold
+    recorder.dynamic_energy_threshold = False
+
+    source = sr.Microphone(sample_rate=16000)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    audio_model = whisper.load_model(model_size).to(device)
+
+    transcription = ['']
+
+    with source:
+        recorder.adjust_for_ambient_noise(source)
+
+    recorder.listen_in_background(source, lambda _, audio: record_callback(data_queue, audio), phrase_time_limit=record_timeout)
+
+    print("Модель загружена. Нажмите 's' для начала записи и 'q' для завершения.\n")
+
+    recording = False
+
+    chat = GigaChat(
+        credentials='Key',
+        verify_ssl_certs=False)
+
+    messages = [
+        SystemMessage(
+            content="Ты Генри Форд, поддерживай диалог с пользователем, задавай вопросы, расскажи о себе и своих машинах",
+            role="Генри Форд, отвечай как он, представьчто это твоя роль"
+        )
+    ]
+
+    try:
+        while True:
+            if keyboard.is_pressed('s'):
+                if not recording:
+                    recording = True
+                    print("Начало записи...")
+                    sleep(0.2)
+
+            elif keyboard.is_pressed('q'):
+                if recording:
+                    recording = False
+                    print("Завершение записи...")
+                    sleep(0.2)
+
+            if recording:
+                now = datetime.now()
+                if not data_queue.empty():
+                    phrase_complete = False
+                    if phrase_time and now - phrase_time > timedelta(seconds=phrase_timeout):
+                        phrase_complete = True
+                    phrase_time = now
+
+                    audio_data = b''.join(data_queue.queue)
+                    data_queue.queue.clear()
+
+                    text = transcribe_audio(audio_model, audio_data, device)
+
+                    if phrase_complete:
+                        transcription.append(text)
+                    else:
+                        transcription[-1] = text
+
+                    os.system('cls' if os.name == 'nt' else 'clear')
+                    for line in transcription:
+                        print(line)
+                    print('', end='', flush=True)
+
+                    if text:
+                        messages.append(HumanMessage(content=text))
+                        res = chat(messages)
+                        messages.append(res)
+                        print("Генри: ", res.content)
+
+                        try:
+                            tts_device = torch.device('cpu')
+                            torch.set_num_threads(4)
+                            local_file = 'model.pt'
+
+                            if not os.path.isfile(local_file):
+                                torch.hub.download_url_to_file('https://models.silero.ai/models/tts/ru/v4_ru.pt', local_file)
+
+                            tts_model = torch.package.PackageImporter(local_file).load_pickle("tts_models", "model")
+                            tts_model.to(tts_device)
+
+                            sample_rate = 48000
+                            speaker = 'baya'
+
+                            normalized_text = normalize_text(res.content)
+                            audio = tts_model.apply_tts(text=normalized_text, speaker=speaker, sample_rate=sample_rate)
+                            print(normalized_text)
+                            sd.play(audio, sample_rate)
+                            time.sleep(len(audio) / sample_rate)
+                            sd.stop()
+                        except Exception as e:
+                            print(f"Ошибка в блоке TTS: {e}")
+                else:
+                    sleep(0.25)
+            else:
+                sleep(0.25)
+    except KeyboardInterrupt:
+        pass
+
+    print("\n\nТранскрипция:")
+    for line in transcription:
+        print(line)
+
+if __name__ == "__main__":
+    main()
